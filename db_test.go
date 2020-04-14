@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -376,6 +377,88 @@ func TestForceCompactL0(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, len(db.lc.levels[0].tables), 0)
 	require.NoError(t, db.Close())
+}
+
+func dirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return err
+	})
+	return (size >> 10), err
+}
+
+// BenchmarkDbGrowth ensures DB does not grow with repeated adds and deletes.
+//
+// New keys are created with each for-loop iteration. During each
+// iteration, the previous for-loop iteration's keys are deleted.
+func BenchmarkDbGrowth(b *testing.B) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(b, err)
+	defer removeDir(dir)
+
+	start := 0
+	lastStart := 0
+	numKeys := 100
+	valueSize := 1024
+	version := uint64(0)
+	hash := fnv.New64()
+	maxWrites := 1000
+	opts := getTestOptions(dir)
+	opts.ValueLogFileSize = 1 << 20
+	opts.MaxTableSize = 16 << 15
+	opts.LevelOneSize = 64 << 15
+	opts.NumVersionsToKeep = 0
+	opts.managedTxns = true
+	for numWrites := 0; numWrites < maxWrites; numWrites++ {
+		db, err := Open(opts)
+		db.SetDiscardTs(uint64(maxWrites))
+		require.NoError(b, err)
+		txn := db.NewTransactionAt(version, true)
+		if version > 0 {
+			for i := lastStart; i < start; i++ {
+				key := make([]byte, 8)
+				binary.BigEndian.PutUint64(key[:], uint64(i))
+				require.NoError(b, txn.Delete(key))
+			}
+		}
+		for i := start; i < numKeys; i++ {
+			key := make([]byte, 8)
+			value := make([]byte, valueSize)
+			binary.BigEndian.PutUint64(key[:], uint64(i))
+			for j := 0; j < valueSize-8; j += 8 {
+				hash.Write(key)
+				binary.BigEndian.PutUint64(value[j:], hash.Sum64())
+			}
+			require.NoError(b, txn.SetEntry(NewEntry(key, value)))
+		}
+		lastStart = start
+		start += numKeys
+		version++
+		require.NoError(b, txn.CommitAt(version, nil))
+		require.NoError(b, db.Flatten(1))
+		db.RunValueLogGC(0.001)
+		size, err := dirSize(dir)
+		require.NoError(b, err)
+		fmt.Printf("Badger DB Size = %dKB\n", size)
+		db.Close()
+	}
+
+	db, err := Open(opts)
+	require.NoError(b, err)
+	db.SetDiscardTs(uint64(maxWrites))
+	require.NoError(b, db.Flatten(1))
+	db.RunValueLogGC(0.001)
+	size, err := dirSize(dir)
+	require.NoError(b, err)
+	require.LessOrEqual(b, size, int64(1280))
+	fmt.Printf("Badger DB Size = %dKB\n", size)
+	db.Close()
 }
 
 // Put a lot of data to move some data to disk.
