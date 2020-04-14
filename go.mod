@@ -1,4 +1,4 @@
-module github.com/tanium/badger
+module github.com/tanium/badger/v2
 
 go 1.12
 
