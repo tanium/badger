@@ -531,7 +531,7 @@ func (s *levelsController) compactBuildTables(
 		bopts.Cache = s.kv.blockCache
 		bopts.BfCache = s.kv.bfCache
 		builder := table.NewTableBuilder(bopts)
-		var numKeys, numSkips uint64
+		var numKeys, numSkips, numVersionGreater, numMerge, numLastValid, numOverlap, badgerKeys uint64
 		for ; it.Valid(); it.Next() {
 			// See if we need to skip the prefix.
 			if len(cd.dropPrefix) > 0 && bytes.HasPrefix(it.Key(), cd.dropPrefix) {
@@ -562,43 +562,83 @@ func (s *levelsController) compactBuildTables(
 				numVersions = 0
 			}
 
+			// TODO - Remove badgerKeys counter when through validating compaction fixes.
+			if bytes.HasPrefix(lastKey, badgerPrefix) {
+				badgerKeys++
+			}
 			vs := it.Value()
 			version := y.ParseTs(it.Key())
 			// Do not discard entries inserted by merge operator. These entries will be
 			// discarded once they're merged
 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
-				// Keep track of the number of versions encountered for this key. Only consider the
-				// versions which are below the minReadTs, otherwise, we might end up discarding the
-				// only valid version for a running transaction.
-				numVersions++
-
-				// Keep the current version and discard all the next versions if
-				// - The `discardEarlierVersions` bit is set OR
-				// - We've already processed `NumVersionsToKeep` number of versions
-				// (including the current item being processed)
-				lastValidVersion := vs.Meta&bitDiscardEarlierVersions > 0 ||
-					numVersions == s.kv.opt.NumVersionsToKeep
-
-				if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) || lastValidVersion {
-					// If this version of the key is deleted or expired, skip all the rest of the
-					// versions. Ensure that we're only removing versions below readTs.
+				// When `NumVersionsToKeep == 0` the skipKey should always be set
+				// and there is no need for `lastValidVersion`. The only required check
+				// is to determine if a deleted key should be written due to `hasOverlap`.
+				if s.kv.opt.NumVersionsToKeep == 0 {
+					// skip all the rest of the versions.
 					skipKey = y.SafeCopy(skipKey, it.Key())
+					if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+						switch {
+						case hasOverlap:
+							numOverlap++
+							// If this key range has overlap with lower levels, then keep the deletion
+							// marker.
+						default:
+							// If no overlap, we can skip all the versions, by continuing here.
+							numSkips++
+							updateStats(vs)
+							continue // Skip adding this key.
+						}
+					}
+				} else {
+					// Keep track of the number of versions encountered for this key. Only consider the
+					// versions which are below the minReadTs, otherwise, we might end up discarding the
+					// only valid version for a running transaction.
+					numVersions++
 
-					switch {
-					case lastValidVersion:
-						// Add this key. We have set skipKey, so the following key versions
-						// would be skipped.
-					case hasOverlap:
-						// If this key range has overlap with lower levels, then keep the deletion
-						// marker with the latest version, discarding the rest. We have set skipKey,
-						// so the following key versions would be skipped.
-					default:
-						// If no overlap, we can skip all the versions, by continuing here.
-						numSkips++
-						updateStats(vs)
-						continue // Skip adding this key.
+					delete := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
+					lastValidVersion := false
+
+					// Only check lastValidVersion if key is not deleted. Otherwise,
+					// a delete key may be retained forever if it is the last entry for that
+					// key. hasOverlap will handle the need to retain a delete key until lower
+					// level keys are removed.
+					if !delete {
+						// Keep the current version and discard all the next versions if
+						// - The `discardEarlierVersions` bit is set OR
+						// - We've already processed `NumVersionsToKeep` number of versions
+						// (including the current item being processed)
+						lastValidVersion = vs.Meta&bitDiscardEarlierVersions > 0 ||
+							numVersions == s.kv.opt.NumVersionsToKeep
+					}
+
+					if delete || lastValidVersion {
+						// If this version of the key is deleted or expired, skip all the rest of the
+						// versions. Ensure that we're only removing versions below readTs.
+						skipKey = y.SafeCopy(skipKey, it.Key())
+
+						switch {
+						case lastValidVersion:
+							numLastValid++
+							// Add this key. We have set skipKey, so the following key versions
+							// would be skipped.
+						case hasOverlap:
+							numOverlap++
+							// If this key range has overlap with lower levels, then keep the deletion
+							// marker with the latest version, discarding the rest. We have set skipKey,
+							// so the following key versions would be skipped.
+						default:
+							// If no overlap, we can skip all the versions, by continuing here.
+							numSkips++
+							updateStats(vs)
+							continue // Skip adding this key.
+						}
 					}
 				}
+			} else if version > discardTs {
+				numVersionGreater++
+			} else if vs.Meta&bitMergeEntry > 0 {
+				numMerge++
 			}
 			numKeys++
 			if vs.Meta&bitValuePointer > 0 {
@@ -608,8 +648,10 @@ func (s *levelsController) compactBuildTables(
 		}
 		// It was true that it.Valid() at least once in the loop above, which means we
 		// called Add() at least once, and builder is not Empty().
-		s.kv.opt.Debugf("LOG Compact. Added %d keys. Skipped %d keys. Iteration took: %v",
-			numKeys, numSkips, time.Since(timeStart))
+		s.kv.opt.Debugf("LOG Compact. Added %d keys. Skipped %d keys. Versions > %d. "+
+			"Merges %d. Last Valid %d. Overlap %d. Badger Keys %d. Iteration took: %v",
+			numKeys, numSkips, numVersionGreater, numMerge, numLastValid,
+			numOverlap, badgerKeys, time.Since(timeStart))
 		build := func(fileID uint64) (*table.Table, error) {
 			fd, err := y.CreateSyncedFile(table.NewFilename(fileID, s.kv.opt.Dir), true)
 			if err != nil {
