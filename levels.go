@@ -571,10 +571,10 @@ func (s *levelsController) compactBuildTables(
 			// Do not discard entries inserted by merge operator. These entries will be
 			// discarded once they're merged
 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
-				// When `NumVersionsToKeep == 0` the skipKey should always be set
+				// When `NumVersionsToKeep == 1` the skipKey should always be set
 				// and there is no need for `lastValidVersion`. The only required check
 				// is to determine if a deleted key should be written due to `hasOverlap`.
-				if s.kv.opt.NumVersionsToKeep == 0 {
+				if s.kv.opt.NumVersionsToKeep == 1 {
 					// skip all the rest of the versions.
 					skipKey = y.SafeCopy(skipKey, it.Key())
 					if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
@@ -596,23 +596,17 @@ func (s *levelsController) compactBuildTables(
 					// only valid version for a running transaction.
 					numVersions++
 
-					delete := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
-					lastValidVersion := false
+					// Keep the current version and discard all the next versions if
+					// - The `discardEarlierVersions` bit is set OR
+					// - We've already processed `NumVersionsToKeep` number of versions
+					// (including the current item being processed)
+					lastValidVersion := vs.Meta&bitDiscardEarlierVersions > 0 ||
+						numVersions == s.kv.opt.NumVersionsToKeep
 
-					// Only check lastValidVersion if key is not deleted. Otherwise,
-					// a delete key may be retained forever if it is the last entry for that
-					// key. hasOverlap will handle the need to retain a delete key until lower
-					// level keys are removed.
-					if !delete {
-						// Keep the current version and discard all the next versions if
-						// - The `discardEarlierVersions` bit is set OR
-						// - We've already processed `NumVersionsToKeep` number of versions
-						// (including the current item being processed)
-						lastValidVersion = vs.Meta&bitDiscardEarlierVersions > 0 ||
-							numVersions == s.kv.opt.NumVersionsToKeep
-					}
+					// NOTE: if NumVersionsToKeep == 0 or is very large, old `badger` keys,
+					// such as `head` entries, need to be removed to prevent continuous growth.
 
-					if delete || lastValidVersion {
+					if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) || lastValidVersion {
 						// If this version of the key is deleted or expired, skip all the rest of the
 						// versions. Ensure that we're only removing versions below readTs.
 						skipKey = y.SafeCopy(skipKey, it.Key())
