@@ -518,19 +518,9 @@ func (vlog *valueLog) rewrite(f *logFile, tr trace.Trace) error {
 		if err != nil {
 			return err
 		}
-		if discardEntry(e, vs) {
+		if discardEntry(e, vs, vlog.db) {
 			return nil
 		}
-		if bytes.HasPrefix(e.Key, badgerMove) {
-			// Verify the actual key entry without the badgerPrefix has not been deleted.
-			// If this is not done the badgerMove entry will be kept forever moving from
-			// vlog to vlog during rewrites.
-			avs, err := vlog.db.get(e.Key[len(badgerMove):])
-			if err != nil || avs.Version == 0 {
-				return err
-			}
-		}
-
 		// Value is still present in value log.
 		if len(vs.Value) == 0 {
 			return errors.Errorf("Empty value: %+v", vs)
@@ -1610,7 +1600,7 @@ func (vlog *valueLog) pickLog(head valuePointer, tr trace.Trace) (files []*logFi
 	return files
 }
 
-func discardEntry(e Entry, vs y.ValueStruct) bool {
+func discardEntry(e Entry, vs y.ValueStruct, db *DB) bool {
 	if vs.Version != y.ParseTs(e.Key) {
 		// Version not found. Discard.
 		return true
@@ -1625,6 +1615,16 @@ func discardEntry(e Entry, vs y.ValueStruct) bool {
 	if (vs.Meta & bitFinTxn) > 0 {
 		// Just a txn finish entry. Discard.
 		return true
+	}
+	if bytes.HasPrefix(e.Key, badgerMove) {
+		// Verify the actual key entry without the badgerPrefix has not been deleted.
+		// If this is not done the badgerMove entry will be kept forever moving from
+		// vlog to vlog during rewrites.
+		avs, err := db.get(e.Key[len(badgerMove):])
+		if err != nil {
+			return false
+		}
+		return avs.Version == 0
 	}
 	return false
 }
@@ -1698,7 +1698,7 @@ func (vlog *valueLog) doRunGC(lf *logFile, discardRatio float64, tr trace.Trace)
 		if err != nil {
 			return err
 		}
-		if discardEntry(e, vs) {
+		if discardEntry(e, vs, vlog.db) {
 			r.discard += esz
 			return nil
 		}
@@ -1745,6 +1745,7 @@ func (vlog *valueLog) doRunGC(lf *logFile, discardRatio float64, tr trace.Trace)
 	})
 
 	if err != nil {
+		vlog.opt.Debugf("Error iterating err=%s, vlog=%+v\n", err, vlog)
 		tr.LazyPrintf("Error while iterating for RunGC: %v", err)
 		tr.SetError()
 		return err
@@ -1755,12 +1756,17 @@ func (vlog *valueLog) doRunGC(lf *logFile, discardRatio float64, tr trace.Trace)
 	// If we couldn't sample at least a 1000 KV pairs or at least 75% of the window size,
 	// and what we can discard is below the threshold, we should skip the rewrite.
 	if (r.count < countWindow && r.total < sizeWindowM*0.75) || r.discard < discardRatio*r.total {
+		vlog.opt.Debugf("Rewrite skipping fid: %d, c: %d, cw: %d, t: %.3f, w: %.3f, d: %.3f, td: %.3f\n",
+			lf.fid, r.count, countWindow, r.total, sizeWindowM*0.75, r.discard, discardRatio*r.total)
+
 		tr.LazyPrintf("Skipping GC on fid: %d", lf.fid)
 		return ErrNoRewrite
 	}
 	if err = vlog.rewrite(lf, tr); err != nil {
+		vlog.opt.Debugf("Rewrite err=%s, vlog=%+v\n", err, vlog)
 		return err
 	}
+	vlog.opt.Debugf("Rewrite Done fid=%d\n", lf.fid)
 	tr.LazyPrintf("Done rewriting.")
 	return nil
 }
