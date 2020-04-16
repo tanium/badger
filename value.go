@@ -667,12 +667,14 @@ func (vlog *valueLog) rewrite(f *logFile, tr trace.Trace) error {
 			delete(vlog.filesMap, f.fid)
 			deleteFileNow = true
 		} else {
+			vlog.opt.Debugf("Defer File Delete fid: %d, ic: %d\n", f.fid, vlog.iteratorCount())
 			vlog.filesToBeDeleted = append(vlog.filesToBeDeleted, f.fid)
 		}
 		vlog.filesLock.Unlock()
 	}
 
 	if deleteFileNow {
+		vlog.opt.Debugf("Delete File Now fid: %d\n", f.fid)
 		if err := vlog.deleteLogFile(f); err != nil {
 			return err
 		}
@@ -686,6 +688,7 @@ func (vlog *valueLog) deleteMoveKeysFor(fid uint32, tr trace.Trace) error {
 	var result []*Entry
 	var count, pointers uint64
 	tr.LazyPrintf("Iterating over move keys to find invalids for fid: %d", fid)
+	vlog.opt.Debugf("Delete Move Keys Before View vlog ic: %d\n", vlog.iteratorCount())
 	err := db.View(func(txn *Txn) error {
 		opt := DefaultIteratorOptions
 		opt.InternalAccess = true
@@ -709,6 +712,8 @@ func (vlog *valueLog) deleteMoveKeysFor(fid uint32, tr trace.Trace) error {
 		}
 		return nil
 	})
+	vlog.opt.Debugf("Delete Move Keys After View vlog ic: %d\n", vlog.iteratorCount())
+
 	if err != nil {
 		tr.LazyPrintf("Got error while iterating move keys: %v", err)
 		tr.SetError()
@@ -1806,6 +1811,7 @@ func (vlog *valueLog) runGC(discardRatio float64, head valuePointer) error {
 			tried[lf.fid] = true
 			err = vlog.doRunGC(lf, discardRatio, tr)
 			if err == nil {
+				vlog.opt.Debugf("Delete Move Keys fid: %d\n", lf.fid)
 				return vlog.deleteMoveKeysFor(lf.fid, tr)
 			}
 		}
