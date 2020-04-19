@@ -70,8 +70,8 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 				}
 			}
 
-			// clear txn and vp bits
-			meta := item.meta &^ (bitTxn | bitFinTxn | bitValuePointer)
+			// clear txn bits
+			meta := item.meta &^ (bitTxn | bitFinTxn)
 			kv := &pb.KV{
 				Key:       item.KeyCopy(nil),
 				Value:     valCopy,
@@ -152,8 +152,7 @@ func (l *KVLoader) Set(kv *pb.KV) error {
 		userMeta = kv.UserMeta[0]
 	}
 	if len(kv.Meta) > 0 {
-		// clear txn and vp bits in case it was missed by older backup routine
-		meta = kv.Meta[0] &^ (bitTxn | bitFinTxn | bitValuePointer)
+		meta = kv.Meta[0]
 	}
 	e := &Entry{
 		Key:       y.KeyWithTs(kv.Key, kv.Version),
